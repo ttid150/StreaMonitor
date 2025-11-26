@@ -4,6 +4,9 @@ import os
 import psutil
 import subprocess
 from threading import Thread
+import streamonitor.log as log
+
+logger = log.Logger("cleanup")
 
 
 class CleanExit:
@@ -78,7 +81,7 @@ class CleanExit:
                             is_streammonitor_related = True
                         
                         if is_streammonitor_related:
-                            print(f"🔫 Killing StreamMonitor FFmpeg: {proc_info['pid']} - {proc_name}")
+                            logger.info(f"🔫 Killing StreamMonitor FFmpeg: {proc_info['pid']} - {proc_name}")
                             proc.kill()
                             killed_count += 1
                             
@@ -90,15 +93,15 @@ class CleanExit:
                     continue
             
             if killed_count > 0:
-                print(f"🧹 Cleaned up {killed_count} StreamMonitor FFmpeg process(es)")
+                logger.info(f"🧹 Cleaned up {killed_count} StreamMonitor FFmpeg process(es)")
                 # Give processes time to die
                 time.sleep(1)
                 
         except Exception as e:
-            print(f"⚠️ Error during FFmpeg cleanup: {e}")
+            logger.error(f"⚠️ Error during FFmpeg cleanup: {e}", exc_info=True)
 
     def clean_exit(self, _=None, __=None):
-        print("🛑 Cleaning up processes...")
+        logger.info("🛑 Cleaning up processes...")
         
         # Stop all streamers first
         for streamer in self.streamers:
@@ -116,6 +119,6 @@ class CleanExit:
         try:
             if os.path.exists("streammonitor.lock"):
                 os.remove("streammonitor.lock")
-                print("🔓 Removed lock file")
+                logger.info("🔓 Removed lock file")
         except Exception:
             pass  # Ignore errors during cleanup

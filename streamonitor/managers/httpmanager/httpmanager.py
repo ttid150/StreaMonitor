@@ -711,9 +711,14 @@ class HTTPManager(Manager):
         # START SERVER
         # ====================================================================
         
+        # Suppress Flask's verbose logging
+        log_level = logging.WARNING
+        logging.getLogger('werkzeug').setLevel(log_level)
+        logging.getLogger('flask').setLevel(log_level)
+        
         try:
             self.logger.info(f"Starting web server on {WEBSERVER_HOST}:{WEBSERVER_PORT}")
-            app.run(host=WEBSERVER_HOST, port=WEBSERVER_PORT)
+            app.run(host=WEBSERVER_HOST, port=WEBSERVER_PORT, debug=False, use_reloader=False)
         except Exception as e:
             self.logger.error(f"Failed to start web server: {e}")
             raise

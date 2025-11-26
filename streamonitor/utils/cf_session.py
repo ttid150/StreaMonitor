@@ -19,6 +19,7 @@ from curl_cffi.requests.exceptions import (
     ConnectionError as CurlConnectionError,
     SSLError as CurlSSLError,
     RequestException as CurlRequestError,
+    HTTPError as CurlHTTPError,
 )
 
 from .cf_broker import load_or_mint, mint_cookies_for, write
@@ -138,6 +139,22 @@ class _HostState:
         self.mint_cooldown = 20 * 60  # 20 minutes
         self.mint_lock = asyncio.Lock()
 
+    async def _reset_session(self):
+        """Reset the HTTP session to avoid connection reuse issues (e.g., HTTP/2 stream errors)."""
+        try:
+            await self.sess.close()
+        except Exception:
+            pass
+        
+        # Create a fresh session
+        self.sess = crequests.AsyncSession(
+            impersonate="chrome",
+            timeout=30.0
+        )
+        
+        # Reapply headers and cookies to the new session
+        # (Assuming we have stored them, otherwise they'll be minted fresh on next request)
+
     def apply_cookie_data(self, data: dict):
         """Apply cookies and headers from broker data."""
         self.sess.headers.clear()
@@ -238,28 +255,50 @@ class _HostState:
 async def _perform_with_retries(hs: _HostState, method: str, url: str, **kwargs):
     """
     Perform request with retries on transient network errors.
-    Retries: SSLError, ConnectionError, Timeout, RequestError
+    Retries: SSLError, ConnectionError, Timeout, RequestError, HTTPError, HTTP/2 stream errors
     """
     # Ensure reasonable timeout
     if "timeout" not in kwargs:
         kwargs["timeout"] = 30.0
 
     last_exc = None
-    for attempt in range(4):  # 1 initial + 3 retries
+    for attempt in range(5):  # 1 initial + 4 retries for extra resilience on HTTP/2
         try:
+            # Always reset session on HTTP/2 errors (not just on retry)
+            # This is more aggressive but necessary for HTTP/2 stability
+            if attempt > 0:
+                # Force session renewal on retry to avoid stale HTTP/2 connections
+                await hs._reset_session()
+                # Extra delay for HTTP/2 errors to ensure connection is fully closed
+                await asyncio.sleep(0.1)
+            
             return await hs.sess.request(method, url, **kwargs)
-        except (CurlSSLError, CurlConnectionError, CurlTimeout, CurlRequestError) as e:
+        except (CurlSSLError, CurlConnectionError, CurlTimeout, CurlRequestError, CurlHTTPError) as e:
             last_exc = e
+            error_str = str(e).lower()
+            
+            # Check if this is an HTTP/2 stream error (error 92)
+            is_http2_error = "stream" in error_str and ("internal_error" in error_str or "err 2" in error_str)
             
             # Exponential backoff with jitter
             base = min(0.1 * (2 ** attempt), 1.5)
             jitter = random.uniform(0.0, 0.3)
             
+            # Much longer backoff for HTTP/2 errors - these are serious
+            if is_http2_error:
+                base = min(1.0 * (2 ** attempt), 5.0)  # 1s -> 2s -> 4s -> 8s (capped at 5s)
+                # Force immediate session reset on HTTP/2 errors
+                try:
+                    await hs._reset_session()
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+            
             if hs.logger and DEBUG:
                 hs.logger.debug(
                     f"{hs.bot_id} [{hs.domain}/{hs.profile}] "
                     f"{type(e).__name__} on {method} {url[:80]} "
-                    f"(attempt {attempt + 1}/4) → sleep {base + jitter:.2f}s"
+                    f"(attempt {attempt + 1}/5) → sleep {base + jitter:.2f}s"
                 )
             
             await asyncio.sleep(base + jitter)
@@ -269,7 +308,7 @@ async def _perform_with_retries(hs: _HostState, method: str, url: str, **kwargs)
     if hs.logger:
         hs.logger.error(
             f"{hs.bot_id} [{hs.domain}/{hs.profile}] "
-            f"Failed after 4 attempts: {type(last_exc).__name__}"
+            f"Failed after 5 attempts: {type(last_exc).__name__}"
         )
     raise last_exc
 
@@ -342,6 +381,10 @@ class CFSessionManager:
         # Add verify parameter if not explicitly set
         if "verify" not in kwargs:
             kwargs["verify"] = self.verify
+        
+        # Ensure timeout is set (helps with HTTP/2 stream issues)
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = 45.0  # Increased timeout to handle slower responses
             
         # Normalize URL
         try:

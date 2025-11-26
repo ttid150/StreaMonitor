@@ -73,6 +73,7 @@ class Bot(Thread):
     status_messages: Dict[Status, str] = {
         Status.UNKNOWN: colored("Unknown error", "red"),
         Status.PUBLIC: colored("Channel online", "green", attrs=["bold"]),
+        Status.ONLINE: colored("Connected, waiting for stream", "cyan", attrs=["bold"]),
         Status.OFFLINE: colored("No stream", "yellow"),
         Status.PRIVATE: colored("Private show", "magenta"),
         Status.DELETED: colored("Model account deleted", "red", attrs=["bold"]),
@@ -558,12 +559,17 @@ class Bot(Thread):
                         if hasattr(self, '_last_restart_time'):
                             time_since_restart = datetime.now().timestamp() - self._last_restart_time
                             if time_since_restart < 60:  # Less than 1 minute since restart
-                                offline_time = 0  # Reset offline timer on fresh restart
-                                self.logger.verbose("Reset offline timer due to recent restart")
+                                offline_time = 0  # Reset offline timer to avoid immediate long-offline timeout
                         
-                        # Just sleep longer after timeout, but don't change status or spam logs
+                        # Sleep with longer timeout after extended offline period
                         sleep_time = self.sleep_on_long_offline if offline_time > self.long_offline_timeout else self.sleep_on_offline
                         self._sleep(sleep_time)
+                        continue
+
+                    elif self.sc == Status.ONLINE:
+                        # Model is connected but no stream yet - wait for it to start
+                        offline_time = 0
+                        self._sleep(self.sleep_on_private)  # Use same wait time as private
                         continue
 
                     elif self.sc == Status.PRIVATE:
@@ -611,7 +617,7 @@ class Bot(Thread):
                         self._stop_cookie_updater()
 
                     else:
-                        self.logger.warning(f"Unknown status: {self.sc}")
+                        self.logger.warning(f"Unknown status: {self.sc} - lastInfo: {list(self.lastInfo.keys())}")
                         self._sleep(self.sleep_on_error)
 
                 except KeyboardInterrupt:

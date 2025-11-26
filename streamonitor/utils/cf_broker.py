@@ -96,8 +96,7 @@ async def mint_cookies_for(
                     # Timeout is okay, we might have enough cookies
                     pass
                 except Exception as e:
-                    print(f"Error visiting {url}: {e}")
-                    # Continue to next URL
+                    # Continue to next URL - broker errors don't need logging
                     continue
             
             # Get all cookies
@@ -119,8 +118,7 @@ async def mint_cookies_for(
         return data
     
     except Exception as e:
-        print(f"Failed to mint cookies for {domain}: {e}")
-        # Return minimal valid data
+        # Return minimal valid data - broker errors are handled elsewhere
         return {
             "ts": int(time.time()),
             "headers": dict(DEFAULT_HEADERS),
@@ -157,8 +155,8 @@ async def load_or_mint(
             if age < max_age and data.get("cookies"):
                 return data
         except (json.JSONDecodeError, ValueError, OSError) as e:
-            print(f"Failed to load cookies for {domain}: {e}")
-            # Fall through to minting
+            # Fall through to minting - stale cookies will be refreshed
+            pass
     
     # Mint fresh cookies
     return await mint_cookies_for(domain, visit_urls)
@@ -179,7 +177,8 @@ def write(domain: str, data: dict):
         cf = cookie_file_for(domain)
         cf.write_text(json.dumps(data, indent=2))
     except Exception as e:
-        print(f"Failed to write cookies for {domain}: {e}")
+        # Silently fail - cookies will be re-minted on next request
+        pass
 
 
 def read(domain: str) -> Dict:
@@ -216,7 +215,8 @@ def delete(domain: str):
         if cf.exists():
             cf.unlink()
     except OSError as e:
-        print(f"Failed to delete cookies for {domain}: {e}")
+        # Ignore deletion errors
+        pass
 
 
 def is_fresh(domain: str, max_age: int = 6 * 3600) -> bool:

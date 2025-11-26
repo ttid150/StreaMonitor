@@ -6,6 +6,7 @@ class Status(Enum):
     NOTRUNNING = 2
     ERROR = 3
     RESTRICTED = 1403
+    ONLINE = 100
     PUBLIC = 200
     NOTEXIST = 400
     PRIVATE = 403

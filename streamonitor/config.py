@@ -6,6 +6,9 @@ from parameters import CONFIG_FILE
 from streamonitor.bot import Bot
 # Import all sites to register them with Bot.loaded_sites
 import streamonitor.sites
+import streamonitor.log as log
+
+logger = log.Logger("config")
 
 
 def load_config():
@@ -17,7 +20,7 @@ def load_config():
             json.dump([], f, indent=4)
             return []
     except Exception as e:
-        print(e)
+        logger.error(f"Failed to load config: {e}", exc_info=True)
         sys.exit(1)
 
 
@@ -28,7 +31,7 @@ def save_config(config):
 
         return True
     except Exception as e:
-        print(e)
+        logger.error(f"Failed to save config: {e}", exc_info=True)
         sys.exit(1)
 
 
