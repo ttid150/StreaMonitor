@@ -322,11 +322,10 @@ class StripChat(Bot):
         return None, None, None
 
     @staticmethod
-    def uniq():
-        """Generate a random unique string for API requests."""
-        chars = ''.join(chr(i) for i in range(ord('a'), ord('z') + 1))
-        chars += ''.join(chr(i) for i in range(ord('0'), ord('9') + 1))
-        return ''.join(random.choice(chars) for _ in range(16))
+    def uniq(length=16):
+        chars = "".join(chr(i) for i in range(ord("a"), ord("z") + 1))
+        chars += "".join(chr(i) for i in range(ord("0"), ord("9") + 1))
+        return "".join(random.choice(chars) for _ in range(length))
 
     @staticmethod
     def normalizeInfo(raw: dict) -> dict:
