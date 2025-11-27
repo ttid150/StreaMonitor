@@ -14,8 +14,9 @@ from typing import Optional, List, Dict, Any, Set, Union, Callable, Type
 
 from streamonitor.enums import Status
 import streamonitor.log as log
+import parameters
 from parameters import (
-    DOWNLOADS_DIR, DEBUG, WANTED_RESOLUTION, WANTED_RESOLUTION_PREFERENCE, 
+    DOWNLOADS_DIR, WANTED_RESOLUTION, WANTED_RESOLUTION_PREFERENCE, 
     CONTAINER, HTTP_USER_AGENT, VERIFY_SSL
 )
 from streamonitor.downloaders.ffmpeg import getVideoFfmpeg
@@ -231,7 +232,7 @@ class Bot(Thread):
         return Status.UNKNOWN
 
     def debug(self, message: str, filename: Optional[str] = None) -> None:
-        if DEBUG:
+        if parameters.DEBUG:
             self.logger.debug(message)
             if not filename:
                 filename = os.path.join(self.outputFolder, 'debug.log')
@@ -616,8 +617,12 @@ class Bot(Thread):
 
                         self._stop_cookie_updater()
 
+                    elif self.sc in (Status.UNKNOWN, Status.ERROR):
+                        # Server error or unknown state - just wait and retry
+                        self._sleep(self.sleep_on_error)
+
                     else:
-                        self.logger.warning(f"Unknown status: {self.sc} - lastInfo: {list(self.lastInfo.keys())}")
+                        self.logger.warning(f"Unhandled status: {self.sc}")
                         self._sleep(self.sleep_on_error)
 
                 except KeyboardInterrupt:

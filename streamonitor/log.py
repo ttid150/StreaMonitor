@@ -40,7 +40,7 @@ class ColoredFormatter(logging.Formatter):
         
         # Color the log level based on level type
         level_colors = {
-            'DEBUG': ("white", ["dim"]),
+            'DEBUG': ("white", []),
             'INFO': ("green", ["bold"]),
             'WARNING': ("yellow", ["bold"]),
             'ERROR': ("red", ["bold"]),

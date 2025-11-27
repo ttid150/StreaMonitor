@@ -20,6 +20,8 @@ class StripChat(Bot):
     _main_js_data = None
     _doppio_js_data = None
     _mouflon_keys: dict = None
+    _mouflon_pkey: str = None   # Cached pkey
+    _mouflon_pdkey: str = None  # Cached pdkey
     _cached_keys: dict[str, bytes] = None
     _ln_array: list = None  # Decoded string array from obfuscated JS
 
@@ -27,12 +29,22 @@ class StripChat(Bot):
         if StripChat._static_data is None:
             StripChat._static_data = {}
             try:
-                self.getInitialData()
+                StripChat.getInitialData()
             except Exception as e:
                 StripChat._static_data = None
                 raise e
         while StripChat._static_data == {}:
             time.sleep(1)
+        
+        # Ensure mouflon keys are available - re-extract if missing
+        if not StripChat._mouflon_pkey or not StripChat._mouflon_pdkey:
+            print("[StripChat] Warning: Mouflon keys missing, attempting re-extraction...")
+            StripChat._parseMouflonKeys()
+            if StripChat._mouflon_keys:
+                StripChat._mouflon_pkey = next(iter(StripChat._mouflon_keys.keys()))
+                StripChat._mouflon_pdkey = StripChat._mouflon_keys[StripChat._mouflon_pkey]
+                print(f"[StripChat] Re-extracted keys: pkey={StripChat._mouflon_pkey}, pdkey={StripChat._mouflon_pdkey}")
+        
         super().__init__(username)
         self.vr = False
         self.getVideo = lambda _, url, filename: getVideoNativeHLS(self, url, filename, StripChat.m3u_decoder)
@@ -43,6 +55,7 @@ class StripChat(Bot):
 
     @classmethod
     def getInitialData(cls):
+        """Fetch static configuration and parse mouflon keys from Doppio JS."""
         r = requests.get('https://hu.stripchat.com/api/front/v3/config/static', headers=cls.headers)
         if r.status_code != 200:
             raise Exception("Failed to fetch static data from StripChat")
@@ -103,9 +116,10 @@ class StripChat(Bot):
         # Parse the obfuscated mouflon keys from Doppio JS
         cls._parseMouflonKeys()
         
-        # Debug: show what keys we found
+        # Cache pkey and pdkey for direct access
         if cls._mouflon_keys:
-            print(f"[StripChat] Found {len(cls._mouflon_keys)} mouflon key(s)")
+            cls._mouflon_pkey = next(iter(cls._mouflon_keys.keys()))
+            cls._mouflon_pdkey = cls._mouflon_keys[cls._mouflon_pkey]
         else:
             print("[StripChat] Warning: No mouflon keys found - stream decoding may fail")
 
@@ -353,20 +367,26 @@ class StripChat(Bot):
         
         return None
 
-    @staticmethod
-    def _getMouflonFromM3U(m3u8_doc):
-        _start = 0
-        _needle = '#EXT-X-MOUFLON:'
-        while _needle in (_doc := m3u8_doc[_start:]):
-            _mouflon_start = _doc.find(_needle)
-            if _mouflon_start > 0:
-                _mouflon = _doc[_mouflon_start:m3u8_doc.find('\n', _mouflon_start)].strip().split(':')
-                psch = _mouflon[2]
-                pkey = _mouflon[3]
-                pdkey = StripChat.getMouflonDecKey(pkey)
-                if pdkey:
-                    return psch, pkey, pdkey
-            _start += _mouflon_start + len(_needle)
+    @classmethod
+    def _getMouflonFromM3U(cls, m3u8_doc):
+        """
+        Extract psch, pkey, pdkey from m3u8 MOUFLON tags.
+        Uses cached class variables for pkey/pdkey.
+        """
+        # Return cached keys directly - they were extracted once at startup
+        if cls._mouflon_pkey and cls._mouflon_pdkey:
+            return 'v1', cls._mouflon_pkey, cls._mouflon_pdkey
+        
+        # Keys missing - try to re-extract
+        if cls._doppio_js_data:
+            print("[StripChat] Keys missing in _getMouflonFromM3U, attempting re-extraction...")
+            cls._parseMouflonKeys()
+            if cls._mouflon_keys:
+                cls._mouflon_pkey = next(iter(cls._mouflon_keys.keys()))
+                cls._mouflon_pdkey = cls._mouflon_keys[cls._mouflon_pkey]
+                print(f"[StripChat] Re-extracted: pkey={cls._mouflon_pkey}, pdkey={cls._mouflon_pdkey}")
+                return 'v1', cls._mouflon_pkey, cls._mouflon_pdkey
+        
         return None, None, None
 
     @staticmethod
@@ -699,17 +719,39 @@ class StripChat(Bot):
         return self.getIsMobile()
 
     def getPlaylistVariants(self, url):
-        url = "https://edge-hls.{host}/hls/{id}{vr}/master/{id}{vr}{auto}.m3u8".format(
+        playlist_url = "https://edge-hls.{host}/hls/{id}{vr}/master/{id}{vr}{auto}.m3u8".format(
                 host='doppiocdn.' + random.choice(['org', 'com', 'net']),
                 id=self.getStreamName(),
                 vr='_vr' if self.vr else '',
                 auto='_auto' if not self.vr else ''
             )
-        result = requests.get(url, headers=self.headers, cookies=self.cookies)
+        self.debug(f"Fetching playlist from: {playlist_url}")
+        result = requests.get(playlist_url, headers=self.headers, cookies=self.cookies)
+        self.debug(f"Playlist response: {result.status_code}")
+        
+        if result.status_code != 200:
+            self.logger.error(f"Failed to fetch playlist: HTTP {result.status_code}")
+            self.debug(f"Response body: {result.text[:500]}")
+            return []
+            
         m3u8_doc = result.content.decode("utf-8")
+        self.debug(f"M3U8 content (first 300 chars): {m3u8_doc[:300]}")
+        
         psch, pkey, pdkey = StripChat._getMouflonFromM3U(m3u8_doc)
-        self.debug(f"Extracted key {psch}, {pkey}, {pdkey}")
+        self.debug(f"Extracted key psch={psch}, pkey={pkey}, pdkey={pdkey}")
+        
+        if not pkey:
+            self.logger.error("No mouflon pkey available - keys not extracted at startup?")
+            self.debug(f"Class state: _mouflon_pkey={StripChat._mouflon_pkey}, _mouflon_pdkey={StripChat._mouflon_pdkey}")
+            return []
+        
         variants = super().getPlaylistVariants(m3u_data=m3u8_doc)
+        self.debug(f"Parsed {len(variants) if variants else 0} variants from playlist")
+        
+        if not variants:
+            self.logger.error("No variants found in playlist")
+            return []
+            
         return [
             variant
             | {

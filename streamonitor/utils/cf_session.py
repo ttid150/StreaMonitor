@@ -10,7 +10,7 @@ import threading
 from typing import Dict, List, Optional, Union
 from urllib.parse import urlparse
 
-from parameters import DEBUG
+import parameters
 
 from curl_cffi import requests as crequests
 from curl_cffi import Cookies
@@ -200,7 +200,7 @@ class _HostState:
                 wait_backoff = max(0.0, self.next_ok_time - now)
             
             if wait_backoff > 0:
-                if self.logger and DEBUG:
+                if self.logger and parameters.DEBUG:
                     self.logger.debug(
                         f"{self.bot_id} [{self.domain}/{self.profile}] "
                         f"backoff {wait_backoff:.2f}s"
@@ -294,7 +294,7 @@ async def _perform_with_retries(hs: _HostState, method: str, url: str, **kwargs)
                 except Exception:
                     pass
             
-            if hs.logger and DEBUG:
+            if hs.logger and parameters.DEBUG:
                 hs.logger.debug(
                     f"{hs.bot_id} [{hs.domain}/{hs.profile}] "
                     f"{type(e).__name__} on {method} {url[:80]} "
@@ -407,7 +407,7 @@ class CFSessionManager:
         
         hs = await self._ensure_host(domain, bucket)
         
-        if self.logger and DEBUG:
+        if self.logger and parameters.DEBUG:
             self.logger.debug(f"{self.bot_id} [{domain}/{bucket}] {method} {url[:80]}")
 
         # Rate limiting with optional API serialization
