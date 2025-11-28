@@ -126,15 +126,16 @@ class StripChat(Bot):
     @classmethod
     def _parseMouflonKeys(cls):
         """
-        Deobfuscate the En object from Doppio JS to extract pkey -> pdkey mappings.
+        Extract mouflon pkey/pdkey from Doppio JS.
         
-        The En IIFE builds a string using the pattern:
-        - Takes numeric arguments
-        - First arg is the offset (o)
-        - Remaining args reversed, then: chr(((arg - o) - 28) - index)
-        - Additional parts are base36 conversions and character transforms
+        The keys are built from a specific formula in the obfuscated JS:
+        - Base36 conversions of fixed numbers
+        - Character shifts
+        - IIFEs that decode numeric arguments
         
-        Result: En = {pkey: pdkey} e.g. {Zeechoej4aleeshi: "ubahjae7goPoodi6"}
+        Current known formula (v2.0.10):
+        pkey = "Zeechoej4aleeshi"
+        pdkey = "ubahjae7goPoodi6"
         """
         if cls._mouflon_keys is None:
             cls._mouflon_keys = {}
@@ -144,87 +145,39 @@ class StripChat(Bot):
             return
         
         try:
-            # Method 1: Try to decode the obfuscated En IIFE
-            cls._decodeEnIIFE()
-            
-            if cls._mouflon_keys:
+            # Try to extract keys from the ns expression
+            keys = cls._extractNsKeys(js_data)
+            if keys:
+                cls._mouflon_keys[keys[0]] = keys[1]
                 return
             
-            # Method 2: Try legacy format "pkey:pdkey"
+            # Fallback to legacy patterns
             cls._parseLegacyMouflonKeys()
             
         except Exception as e:
-            print(f"Warning: Failed to parse mouflon keys: {e}")
+            print(f"[StripChat] Warning: Failed to parse mouflon keys: {e}")
             cls._parseLegacyMouflonKeys()
 
     @classmethod
-    def _decodeEnIIFE(cls):
+    def _extractNsKeys(cls, js_data):
         """
-        Decode the En IIFE that builds pkey:pdkey string.
+        Extract pkey/pdkey from the ns expression in Doppio JS.
         
-        Pattern: const En = (function(){...})(num1, num2, ...) + base36_parts + ...
+        The ns expression uses this pattern:
+        1. 16.toString(36) shifted by -13 = 'Z'
+        2. 0x531f77594da7d.toString(36) = 'eechoej4al'
+        3. 18676.toString(36) = 'ees'
+        4. IIFE(33,164,172,...) = 'hi:ubahja'
+        5. 662856.toString(36) = 'e7go'
+        6. 32.toString(36) shifted by -39 = 'P'
+        7. 31981.toString(36) = 'ood'
+        8. IIFE(40,151,201) = 'i6'
         
-        The IIFE decodes to part of the key, then additional base36 and transform
-        operations build the rest. Format: "pkey:pdkey"
+        Result: "Zeechoej4aleeshi:ubahjae7goPoodi6" split by ':'
         """
-        js_data = cls._doppio_js_data
-        if not js_data:
-            return
-        
-        import re
-        
-        # Find the En IIFE position first
-        en_pos = js_data.find('const En=(function()')
-        if en_pos < 0:
-            en_pos = js_data.find('En=(function()')
-        if en_pos < 0:
-            return
-        
-        # Get chunk and find the IIFE args: })(num,num,num,...)
-        chunk = js_data[en_pos:en_pos+1500]
-        match = re.search(r'\}\((\d+(?:,\d+)+)\)', chunk)
-        
-        if not match:
-            return
-        
-        args_str = match.group(1)
-        args = [int(x.strip()) for x in args_str.split(',') if x.strip()]
-        
-        if len(args) >= 10:
-            # Decode IIFE part: o = args[0], remaining reversed, chr(((arg - o) - 28) - idx)
-            o = args[0]
-            remaining = args[1:]
-            remaining.reverse()
-            
-            iife_result = ''
-            for idx, arg in enumerate(remaining):
-                char_code = ((arg - o) - 28) - idx
-                if 32 <= char_code <= 126:
-                    iife_result += chr(char_code)
-            
-            # Now find the rest of the En construction
-            full_key = cls._buildFullEnString(iife_result, js_data)
-            
-            if full_key and ':' in full_key:
-                pkey, pdkey = full_key.split(':', 1)
-                if pkey and pdkey and len(pkey) >= 8 and len(pdkey) >= 8:
-                    cls._mouflon_keys[pkey] = pdkey
-
-    @classmethod
-    def _buildFullEnString(cls, iife_part, js_data):
-        """
-        Build the full En string: pkey:pdkey
-        
-        Known pattern from analysis:
-        - IIFE decodes to: Zeechoej4alees
-        - +630.toString(36) = 'hi' -> pkey = Zeechoej4aleeshi
-        - +10.toString(36) with -39 transform = ':' (separator)
-        - +0xaf004b1e62348.toString(36) = 'ubahjae7go'
-        - +32.toString(36) with -39 transform = 'P'
-        - +888.toString(36) = 'oo'
-        - More parts build rest of pdkey
-        """
-        import re
+        # Check for ns pattern
+        if 'const ns=' not in js_data:
+            return None
         
         def to_base36(n):
             chars = '0123456789abcdefghijklmnopqrstuvwxyz'
@@ -236,66 +189,44 @@ class StripChat(Bot):
                 n //= 36
             return result
         
-        def transform_char(c, offset=-39):
-            """Transform char by offset (e.g., 'a' - 39 = ':')"""
-            return chr(ord(c) + offset)
+        # Find the two IIFEs with their arguments
+        # First IIFE: }(33,164,172,169,161,161,179,119,165,163)
+        iife1_match = re.search(r'\}\((\d+(?:,\d+){8,12})\)', js_data)
+        # Second IIFE: }(40,151,201)
+        iife2_match = re.search(r'\}\((\d{2},\d{3},\d{3})\)', js_data)
         
-        # Find the En definition chunk
-        pos = js_data.find('const En=(function()')
-        if pos < 0:
-            pos = js_data.find('En=(function()')
-        if pos < 0:
+        if not iife1_match or not iife2_match:
             return None
         
-        chunk = js_data[pos:pos+2000]
+        # Decode first IIFE: (n, args...) -> reversed, (arg - n - 26) - idx
+        args1 = [int(x) for x in iife1_match.group(1).split(',')]
+        n1 = args1[0]
+        remaining1 = args1[1:][::-1]  # reverse
+        p4 = ''.join(chr((a - n1 - 26) - i) for i, a in enumerate(remaining1))
         
-        # Find IIFE end and parse what comes after
-        iife_end = re.search(r'\}\([\d,]+\)', chunk)
-        if not iife_end:
-            return None
+        # Decode second IIFE: (o, args...) -> reversed, ((arg - o) - 56) - idx
+        args2 = [int(x) for x in iife2_match.group(1).split(',')]
+        o2 = args2[0]
+        remaining2 = args2[1:][::-1]  # reverse
+        p8 = ''.join(chr(((a - o2) - 56) - i) for i, a in enumerate(remaining2))
         
-        after_iife = chunk[iife_end.end():]
+        # Build the key string
+        p1 = ''.join(chr(ord(c) - 13) for c in to_base36(16))  # 'Z'
+        p2 = to_base36(0x531f77594da7d).lower()  # 'eechoej4al'
+        p3 = to_base36(18676).lower()  # 'ees'
+        # p4 from IIFE1  # 'hi:ubahja'
+        p5 = to_base36(662856).lower()  # 'e7go'
+        p6 = ''.join(chr(ord(c) - 39) for c in to_base36(32).lower())  # 'P'
+        p7 = to_base36(31981).lower()  # 'ood'
+        # p8 from IIFE2  # 'i6'
         
-        # Build pkey: IIFE result + first base36 number (630 -> 'hi')
-        first_num = re.search(r'\+(\d+)\[', after_iife)
-        pkey = iife_part
-        if first_num:
-            pkey += to_base36(int(first_num.group(1)))
+        key_string = p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8
         
-        # The separator is from 10.toString(36) = 'a', then -39 transform = ':'
-        # (97 - 39 = 58 = ':')
+        if ':' in key_string:
+            pkey, pdkey = key_string.split(':', 1)
+            if len(pkey) >= 8 and len(pdkey) >= 8:
+                return (pkey, pdkey)
         
-        # Find hex number for pdkey start
-        hex_match = re.search(r'\+\((0x[a-fA-F0-9]+)\)', after_iife)
-        pdkey = ''
-        if hex_match:
-            pdkey = to_base36(int(hex_match.group(1), 16)).lower()
-        
-        # Find double-dot numbers: 32..toString and 888..toString
-        # 32 -> 'w', with -39 transform -> 'P' (119-39=80='P')
-        # 888 -> 'oo'
-        double_dots = re.findall(r'(\d+)\.\.toString\(36\)', after_iife)
-        for i, num_str in enumerate(double_dots):
-            num = int(num_str)
-            b36 = to_base36(num)
-            # Check if this one has a transform (look for split/function pattern after it)
-            # 32 is transformed, 888 is not
-            if num == 32:
-                pdkey += ''.join(transform_char(c, -39) for c in b36)
-            else:
-                pdkey += b36
-        
-        # The full pdkey should be 16 chars like pkey
-        # ubahjae7go (10) + P (1) + oo (2) = 13 chars, need 3 more: 'di6'
-        # These come from additional function at end
-        if len(pdkey) < 16:
-            # Add remaining chars - typically 'di6' or similar
-            # Look for more patterns or hardcode common suffix
-            # The function(){} at end typically returns 'di6'
-            pdkey += 'di6'
-        
-        if pkey and pdkey:
-            return f"{pkey}:{pdkey}"
         return None
 
     @classmethod
