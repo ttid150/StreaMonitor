@@ -520,8 +520,11 @@ class Bot(Thread):
                         self._consecutive_errors += 1
                         self._sleep(self.sleep_on_error)
                         continue
+                    else:
+                        # Reset error counter on any successful status check
+                        self._consecutive_errors = 0
 
-                    elif self.sc == Status.NOTEXIST:
+                    if self.sc == Status.NOTEXIST:
                         self.logger.error(f"❌ User {self.username} does not exist - auto-removing from configuration")
                         # Auto-remove the non-existent model from configuration
                         if Bot.auto_remove_model(self.username, self.site, "non-existent"):
@@ -773,6 +776,12 @@ class Bot(Thread):
     @property
     def outputFolder(self) -> str:
         base_folder = os.path.join(DOWNLOADS_DIR, f"{self.username} [{self.siteslug}]")
+        if hasattr(self, 'isMobile') and callable(getattr(self, 'isMobile', None)):
+            try:
+                if self.isMobile():
+                    base_folder = os.path.join(base_folder, 'Mobile')
+            except Exception:
+                pass
         return base_folder
 
     def genOutFilename(self, create_dir: bool = True) -> str:

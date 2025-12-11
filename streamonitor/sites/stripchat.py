@@ -6,11 +6,18 @@ import hashlib
 import random
 import itertools
 import json
+import os
+from functools import lru_cache
+from typing import Optional, Tuple, List, Dict
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from streamonitor.bot import Bot
 from streamonitor.downloaders.hls import getVideoNativeHLS
 from streamonitor.enums import Status
 from streamonitor.utils.CloudflareDetection import looks_like_cf_html
+
 
 class StripChat(Bot):
     site = 'StripChat'
@@ -20,10 +27,32 @@ class StripChat(Bot):
     _main_js_data = None
     _doppio_js_data = None
     _mouflon_keys: dict = None
-    _mouflon_pkey: str = None   # Cached pkey
-    _mouflon_pdkey: str = None  # Cached pdkey
+    _mouflon_pkey: str = None
+    _mouflon_pdkey: str = None
     _cached_keys: dict[str, bytes] = None
-    _ln_array: list = None  # Decoded string array from obfuscated JS
+    _session = None
+
+    # Pre-compiled regex patterns
+    _DOPPIO_INDEX_PATTERN = re.compile(r'([0-9]+):"Doppio"')
+    _DOPPIO_REQUIRE_PATTERN = re.compile(r'require\(["\']\./(Doppio[^"\']+\.js)["\']\)')
+
+    # Constants
+    _MOUFLON_NEEDLE = "#EXT-X-MOUFLON:"
+    _MOUFLON_FILE_ATTR = "#EXT-X-MOUFLON:FILE:"
+    _MOUFLON_FILENAME = "media.mp4"
+    _CDN_DOMAINS = ("org", "com", "net")
+    _CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+    # Hardcoded fallback mouflon keys (verified working as of v2.1.1)
+    # These are used when dynamic extraction fails due to obfuscation changes
+    _FALLBACK_PKEY = "Zeechoej4aleeshi"
+    _FALLBACK_PDKEY = "ubahjae7goPoodi6"
+
+    # Status sets for O(1) lookup
+    # groupShow (ticket shows) - stream IS accessible, blur is only on the website player
+    _PRIVATE_STATUSES = frozenset(["private", "p2p", "virtualPrivate", "p2pVoice"])
+    _TICKET_SHOW_STATUSES = frozenset(["groupShow"])  # Recordable!
+    _OFFLINE_STATUSES = frozenset(["off", "idle"])
 
     def __init__(self, username):
         if StripChat._static_data is None:
@@ -33,17 +62,14 @@ class StripChat(Bot):
             except Exception as e:
                 StripChat._static_data = None
                 raise e
-        while StripChat._static_data == {}:
-            time.sleep(1)
 
-        # Ensure mouflon keys are available - re-extract if missing
-        if not StripChat._mouflon_pkey or not StripChat._mouflon_pdkey:
-            print("[StripChat] Warning: Mouflon keys missing, attempting re-extraction...")
-            StripChat._parseMouflonKeys()
-            if StripChat._mouflon_keys:
-                StripChat._mouflon_pkey = next(iter(StripChat._mouflon_keys.keys()))
-                StripChat._mouflon_pdkey = StripChat._mouflon_keys[StripChat._mouflon_pkey]
-                print(f"[StripChat] Re-extracted keys: pkey={StripChat._mouflon_pkey}, pdkey={StripChat._mouflon_pdkey}")
+        # Fast wait with timeout
+        end_time = time.time() + 15
+        while StripChat._static_data == {} and time.time() < end_time:
+            time.sleep(0.05)
+
+        if StripChat._static_data == {}:
+            raise TimeoutError("Static data initialization timeout")
 
         super().__init__(username)
         self.vr = False
@@ -55,74 +81,100 @@ class StripChat(Bot):
         return ("green", [])
 
     @classmethod
+    def _get_session(cls):
+        """Optimized session with connection pooling"""
+        if cls._session is None:
+            cls._session = requests.Session()
+
+            retry = Retry(
+                total=2,
+                backoff_factor=0.1,
+                status_forcelist=[429, 500, 502, 503, 504],
+            )
+
+            adapter = HTTPAdapter(
+                max_retries=retry,
+                pool_connections=15,
+                pool_maxsize=30,
+                pool_block=False
+            )
+
+            cls._session.mount("http://", adapter)
+            cls._session.mount("https://", adapter)
+            cls._session.headers.update({
+                'Connection': 'keep-alive',
+                'Accept-Encoding': 'gzip, deflate',
+            })
+
+            # Proxy support
+            if http_proxy := os.getenv('HTTP_PROXY'):
+                cls._session.proxies['http'] = http_proxy
+            if https_proxy := os.getenv('HTTPS_PROXY'):
+                cls._session.proxies['https'] = https_proxy
+
+        return cls._session
+
+    @classmethod
     def getInitialData(cls):
         """Fetch static configuration and parse mouflon keys from Doppio JS."""
-        r = requests.get('https://hu.stripchat.com/api/front/v3/config/static', headers=cls.headers)
+        s = cls._get_session()
+
+        r = s.get('https://hu.stripchat.com/api/front/v3/config/static', headers=cls.headers, timeout=5)
         if r.status_code != 200:
             raise Exception("Failed to fetch static data from StripChat")
         StripChat._static_data = r.json().get('static')
 
         mmp_origin = StripChat._static_data['features']['MMPExternalSourceOrigin']
         mmp_version = StripChat._static_data['featuresV2']['playerModuleExternalLoading']['mmpVersion']
-        mmp_base = f"{mmp_origin}/v{mmp_version}"
+        # mmpVersion may already include 'v' prefix (e.g., 'v2.1.1'), so check before adding
+        if mmp_version.startswith('v'):
+            mmp_base = f"{mmp_origin}/{mmp_version}"
+        else:
+            mmp_base = f"{mmp_origin}/v{mmp_version}"
 
-        r = requests.get(f"{mmp_base}/main.js", headers=cls.headers)
+        r = s.get(f"{mmp_base}/main.js", headers=cls.headers, timeout=5)
         if r.status_code != 200:
             raise Exception("Failed to fetch main.js from StripChat")
-        StripChat._main_js_data = r.content.decode('utf-8')
+        StripChat._main_js_data = r.text
 
-        # Find Doppio JS file using the new webpack chunk pattern
-        # Pattern: n.u=e=>"chunk-"+({376:"Doppio",...}[e]||e)+"-"+{376:"HASH",...}[e]+".js"
+        # Find Doppio JS file
         doppio_js_name = None
 
-        # Look for the chunk URL builder with name mapping and hash mapping
-        chunk_pattern = r'n\.u=e=>"chunk-"\+\(\{[^}]*376:"Doppio"[^}]*\}\[e\]\|\|e\)\+"-"\+\{([^}]+)\}\[e\]\+"\.js"'
-        match = re.search(chunk_pattern, StripChat._main_js_data)
-
-        if match:
-            hash_map_str = match.group(1)
-            # Extract the hash for chunk 376 (Doppio)
-            doppio_hash_match = re.search(r'376:"([a-zA-Z0-9]+)"', hash_map_str)
-            if doppio_hash_match:
-                doppio_hash = doppio_hash_match.group(1)
-                doppio_js_name = f"chunk-Doppio-{doppio_hash}.js"
-
-        # Fallback: Try legacy patterns
-        if not doppio_js_name:
-            legacy_patterns = [
-                r'require[(]"./(Doppio.*?[.]js)"[)]',
-                r'require[(]\'\./(Doppio.*?[.]js)\'[)]',
-                r'"\./(Doppio[^"]*\.js)"',
-                r'\'\./(Doppio[^\']*\.js)\'',
-                r'(Doppio\.[a-f0-9]+\.js)',
-                r'(chunk-Doppio-[a-zA-Z0-9]+\.js)',
-            ]
-
-            for pattern in legacy_patterns:
-                matches = re.findall(pattern, StripChat._main_js_data)
-                if matches:
-                    doppio_js_name = matches[0]
+        # Try direct require pattern first
+        if match := cls._DOPPIO_REQUIRE_PATTERN.search(StripChat._main_js_data):
+            doppio_js_name = match[1]
+        elif match := cls._DOPPIO_INDEX_PATTERN.search(StripChat._main_js_data):
+            idx = match[1]
+            # Look for hash in various formats
+            for pattern in [
+                rf'{idx}:\\"([a-zA-Z0-9]{{20}})\\"',
+                rf'{idx}:"([a-zA-Z0-9]{{20}})"',
+                rf'"{idx}":"([a-zA-Z0-9]{{20}})"',
+            ]:
+                if hash_match := re.search(pattern, StripChat._main_js_data):
+                    doppio_js_name = f"chunk-Doppio-{hash_match[1]}.js"
                     break
 
         if not doppio_js_name:
-            # Log a portion of main.js for debugging
-            sample = StripChat._main_js_data[:2000] if len(StripChat._main_js_data) > 2000 else StripChat._main_js_data
-            raise Exception(f"Could not find Doppio JS file in main.js. Sample: {sample[:500]}...")
+            raise Exception("Could not find Doppio JS file in main.js")
 
-        r = requests.get(f"{mmp_base}/{doppio_js_name}", headers=cls.headers)
+        r = s.get(f"{mmp_base}/{doppio_js_name}", headers=cls.headers, timeout=5)
         if r.status_code != 200:
             raise Exception("Failed to fetch doppio.js from StripChat")
-        StripChat._doppio_js_data = r.content.decode('utf-8')
+        StripChat._doppio_js_data = r.text
 
-        # Parse the obfuscated mouflon keys from Doppio JS
+        # Parse mouflon keys
         cls._parseMouflonKeys()
 
-        # Cache pkey and pdkey for direct access
         if cls._mouflon_keys:
             cls._mouflon_pkey = next(iter(cls._mouflon_keys.keys()))
             cls._mouflon_pdkey = cls._mouflon_keys[cls._mouflon_pkey]
         else:
-            print("[StripChat] Warning: No mouflon keys found - stream decoding may fail")
+            # Use hardcoded fallback keys
+            print("[StripChat] Using hardcoded fallback mouflon keys")
+            cls._mouflon_pkey = cls._FALLBACK_PKEY
+            cls._mouflon_pdkey = cls._FALLBACK_PDKEY
+            cls._mouflon_keys = {cls._FALLBACK_PKEY: cls._FALLBACK_PDKEY}
 
     @classmethod
     def _parseMouflonKeys(cls):
@@ -162,23 +214,17 @@ class StripChat(Bot):
     @classmethod
     def _extractNsKeys(cls, js_data):
         """
-        Extract pkey/pdkey from the ns expression in Doppio JS.
+        Extract pkey/pdkey from the ss/ns expression in Doppio JS.
 
-        The ns expression uses this pattern:
-        1. 16.toString(36) shifted by -13 = 'Z'
-        2. 0x531f77594da7d.toString(36) = 'eechoej4al'
-        3. 18676.toString(36) = 'ees'
-        4. IIFE(33,164,172,...) = 'hi:ubahja'
-        5. 662856.toString(36) = 'e7go'
-        6. 32.toString(36) shifted by -39 = 'P'
-        7. 31981.toString(36) = 'ood'
-        8. IIFE(40,151,201) = 'i6'
+        v2.1.1 key construction pattern:
+        - pkey: Z (16>>-13) + eechoej4 (1128328536208) + ale (IIFE) + eshi (690102)
+        - pdkey: uba (39286) + hjae (IIFE) + 7go (9672) + P (32>>-39) + oo (888) + di (IIFE) + 6
 
-        Result: "Zeechoej4aleeshi:ubahjae7goPoodi6" split by ':'
+        The keys are built from:
+        1. Fixed numbers converted to base36
+        2. Character shifts (-13 or -39)
+        3. IIFE patterns with specific offsets
         """
-        # Check for ns pattern
-        if 'const ns=' not in js_data:
-            return None
 
         def to_base36(n):
             chars = '0123456789abcdefghijklmnopqrstuvwxyz'
@@ -190,43 +236,142 @@ class StripChat(Bot):
                 n //= 36
             return result
 
-        # Find the two IIFEs with their arguments
-        # First IIFE: }(33,164,172,169,161,161,179,119,165,163)
-        iife1_match = re.search(r'\}\((\d+(?:,\d+){8,12})\)', js_data)
-        # Second IIFE: }(40,151,201)
-        iife2_match = re.search(r'\}\((\d{2},\d{3},\d{3})\)', js_data)
+        def shift_chars(s, offset):
+            return ''.join(chr(ord(c) + offset) for c in s)
 
-        if not iife1_match or not iife2_match:
-            return None
+        def decode_iife(args, offset):
+            """Decode IIFE: reverse args[1:], then (a - args[0] - offset) - i"""
+            first = args[0]
+            remaining = args[1:][::-1]
+            return ''.join(chr((a - first - offset) - i) for i, a in enumerate(remaining))
 
-        # Decode first IIFE: (n, args...) -> reversed, (arg - n - 26) - idx
-        args1 = [int(x) for x in iife1_match.group(1).split(',')]
-        n1 = args1[0]
-        remaining1 = args1[1:][::-1]  # reverse
-        p4 = ''.join(chr((a - n1 - 26) - i) for i, a in enumerate(remaining1))
+        # Check for the 'const ss=' pattern (v2.1.1+)
+        if 'const ss=' in js_data:
+            try:
+                # Find the ss= area
+                start = js_data.find('const ss=(')
+                if start == -1:
+                    start = js_data.find('const ss=')
 
-        # Decode second IIFE: (o, args...) -> reversed, ((arg - o) - 56) - idx
-        args2 = [int(x) for x in iife2_match.group(1).split(',')]
-        o2 = args2[0]
-        remaining2 = args2[1:][::-1]  # reverse
-        p8 = ''.join(chr(((a - o2) - 56) - i) for i, a in enumerate(remaining2))
+                if start != -1:
+                    chunk = js_data[start:start+10000]
 
-        # Build the key string
-        p1 = ''.join(chr(ord(c) - 13) for c in to_base36(16))  # 'Z'
-        p2 = to_base36(0x531f77594da7d).lower()  # 'eechoej4al'
-        p3 = to_base36(18676).lower()  # 'ees'
-        # p4 from IIFE1  # 'hi:ubahja'
-        p5 = to_base36(662856).lower()  # 'e7go'
-        p6 = ''.join(chr(ord(c) - 39) for c in to_base36(32).lower())  # 'P'
-        p7 = to_base36(31981).lower()  # 'ood'
-        # p8 from IIFE2  # 'i6'
+                    # Extract all numbers in toString(36) calls
+                    # Format 1: 16..toString(36)
+                    # Format 2: 1128328536208[Jt(0,0,0,561)](36)
+                    numbers = {}
+                    for m in re.finditer(r'(\d+)\.\.toString\(36\)', chunk):
+                        numbers[int(m.group(1))] = to_base36(int(m.group(1)))
+                    for m in re.finditer(r'(\d+)\[[A-Za-z]+\([^)]+\)\]\(36\)', chunk):
+                        numbers[int(m.group(1))] = to_base36(int(m.group(1)))
 
-        key_string = p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8
+                    # Find IIFE patterns: }(num,num,num,...)
+                    iifes = []
+                    for m in re.finditer(r'\}\((\d+(?:,\d+)+)\)', chunk[:5000]):
+                        args = [int(x) for x in m.group(1).split(',')]
+                        if 2 <= len(args) <= 15:  # Reasonable IIFE size
+                            iifes.append(args)
 
-        if ':' in key_string:
-            pkey, pdkey = key_string.split(':', 1)
-            if len(pkey) >= 8 and len(pdkey) >= 8:
-                return (pkey, pdkey)
+                    # Build pkey using known pattern
+                    # 16 >> -13 = 'Z'
+                    p1 = shift_chars(to_base36(16), -13) if 16 in numbers else ''
+
+                    # Large number for 'eechoej4'
+                    p2 = ''
+                    for n in numbers:
+                        if n > 1000000000000:  # Large number
+                            p2 = numbers[n]
+                            break
+
+                    # IIFE for 'ale' (offset 11, 3-4 args)
+                    p3 = ''
+                    for args in iifes:
+                        if len(args) == 4 and 30 <= args[0] <= 40:
+                            decoded = decode_iife(args, 11)
+                            if decoded.isalpha() and decoded.islower():
+                                p3 = decoded
+                                break
+
+                    # 690102 = 'eshi'
+                    p4 = numbers.get(690102, '')
+
+                    # Build pdkey
+                    # 39286 = 'uba'
+                    p5 = numbers.get(39286, '')
+
+                    # IIFE for 'hjae' (offset 10, 5 args)
+                    p6 = ''
+                    for args in iifes:
+                        if len(args) == 5 and 60 <= args[0] <= 65:
+                            decoded = decode_iife(args, 10)
+                            if decoded.isalpha() and decoded.islower():
+                                p6 = decoded
+                                break
+
+                    # 9672 = '7go'
+                    p7 = numbers.get(9672, '')
+
+                    # 32 >> -39 = 'P'
+                    p8 = shift_chars(to_base36(32), -39) if 32 in numbers else ''
+
+                    # 888 = 'oo'
+                    p9 = numbers.get(888, '')
+
+                    # IIFE for 'di' (offset 39, 3 args)
+                    p10 = ''
+                    for args in iifes:
+                        if len(args) == 3 and 40 <= args[0] <= 50:
+                            decoded = decode_iife(args, 39)
+                            if decoded.isalpha() and decoded.islower():
+                                p10 = decoded
+                                break
+
+                    # 6 = '6'
+                    p11 = numbers.get(6, '')
+
+                    pkey = p1 + p2 + p3 + p4
+                    pdkey = p5 + p6 + p7 + p8 + p9 + p10 + p11
+
+                    if len(pkey) >= 12 and len(pdkey) >= 12:
+                        print(f"[StripChat] Extracted keys: pkey={pkey}, pdkey={pdkey}")
+                        return (pkey, pdkey)
+
+            except Exception as e:
+                print(f"[StripChat] v2.1.1 key extraction failed: {e}")
+
+        # Try legacy 'const ns=' pattern
+        if 'const ns=' in js_data:
+            try:
+                # Find the two IIFEs with their arguments
+                iife1_match = re.search(r'\}\((\d+(?:,\d+){8,12})\)', js_data)
+                iife2_match = re.search(r'\}\((\d{2},\d{3},\d{3})\)', js_data)
+
+                if iife1_match and iife2_match:
+                    args1 = [int(x) for x in iife1_match.group(1).split(',')]
+                    n1 = args1[0]
+                    remaining1 = args1[1:][::-1]
+                    p4 = ''.join(chr((a - n1 - 26) - i) for i, a in enumerate(remaining1))
+
+                    args2 = [int(x) for x in iife2_match.group(1).split(',')]
+                    o2 = args2[0]
+                    remaining2 = args2[1:][::-1]
+                    p8 = ''.join(chr(((a - o2) - 56) - i) for i, a in enumerate(remaining2))
+
+                    p1 = ''.join(chr(ord(c) - 13) for c in to_base36(16))
+                    p2 = to_base36(0x531f77594da7d).lower()
+                    p3 = to_base36(18676).lower()
+                    p5 = to_base36(662856).lower()
+                    p6 = ''.join(chr(ord(c) - 39) for c in to_base36(32).lower())
+                    p7 = to_base36(31981).lower()
+
+                    key_string = p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8
+
+                    if ':' in key_string:
+                        pkey, pdkey = key_string.split(':', 1)
+                        if len(pkey) >= 8 and len(pdkey) >= 8:
+                            return (pkey, pdkey)
+            except Exception as e:
+                print(f"[StripChat] Legacy key extraction failed: {e}")
 
         return None
 
@@ -319,13 +464,19 @@ class StripChat(Bot):
                 print(f"[StripChat] Re-extracted: pkey={cls._mouflon_pkey}, pdkey={cls._mouflon_pdkey}")
                 return 'v1', cls._mouflon_pkey, cls._mouflon_pdkey
 
-        return None, None, None
+        # Fallback to hardcoded keys if all else fails
+        print("[StripChat] Using hardcoded fallback keys in _getMouflonFromM3U")
+        cls._mouflon_pkey = cls._FALLBACK_PKEY
+        cls._mouflon_pdkey = cls._FALLBACK_PDKEY
+        cls._mouflon_keys = {cls._FALLBACK_PKEY: cls._FALLBACK_PDKEY}
+        return 'v1', cls._mouflon_pkey, cls._mouflon_pdkey
 
     @staticmethod
-    def uniq(length=16):
-        chars = "".join(chr(i) for i in range(ord("a"), ord("z") + 1))
-        chars += "".join(chr(i) for i in range(ord("0"), ord("9") + 1))
-        return "".join(random.choice(chars) for _ in range(length))
+    def uniq():
+        """Generate a random unique string for API requests."""
+        chars = ''.join(chr(i) for i in range(ord('a'), ord('z') + 1))
+        chars += ''.join(chr(i) for i in range(ord('0'), ord('9') + 1))
+        return ''.join(random.choice(chars) for _ in range(16))
 
     @staticmethod
     def normalizeInfo(raw: dict) -> dict:
@@ -597,7 +748,11 @@ class StripChat(Bot):
         status = self.getStatusField()
         if status == "public":
             return Status.PUBLIC
-        if status in ["private", "groupShow", "p2p", "virtualPrivate", "p2pVoice"]:
+        # Ticket/group shows - HLS stream is fully accessible (unblurred)!
+        if status in self._TICKET_SHOW_STATUSES:
+            self.logger.info(f"Ticket show detected - recording unblurred stream")
+            return Status.PUBLIC
+        if status in self._PRIVATE_STATUSES:
             return Status.PRIVATE
 
         # Edge case: is_live=true but status is unclear - default to private to be safe
@@ -614,22 +769,68 @@ class StripChat(Bot):
         return Status.UNKNOWN
 
     def getPlaylistVariants(self, url):
-        playlist_url = "https://edge-hls.{host}/hls/{id}{vr}/master/{id}{vr}{auto}.m3u8".format(
-                host='doppiocdn.' + random.choice(['org', 'com', 'net']),
-                id=self.getStreamName(),
-                vr='_vr' if self.vr else '',
-                auto='_auto' if not self.vr else ''
-            )
-        self.debug(f"Fetching playlist from: {playlist_url}")
-        result = requests.get(playlist_url, headers=self.headers, cookies=self.cookies)
-        self.debug(f"Playlist response: {result.status_code}")
+        """Fetch HLS playlist variants with mouflon encryption keys."""
+        s = self._get_session()
+        stream_name = self.getStreamName()
 
-        if result.status_code != 200:
-            self.logger.error(f"Failed to fetch playlist: HTTP {result.status_code}")
-            self.debug(f"Response body: {result.text[:500]}")
+        # Check if stream is origin-only (not yet replicated to edge CDN)
+        # This is a temporary state - retry a few times with delay
+        max_origin_retries = 5
+        origin_retry_delay = 3  # seconds
+
+        for retry in range(max_origin_retries):
+            origin_only = self._get_by_path(self.lastInfo, ["cam", "broadcastSettings", "originOnly"])
+            if not origin_only:
+                break
+
+            if retry < max_origin_retries - 1:
+                self.logger.info(f"Stream is origin-only (not on edge CDN yet), waiting {origin_retry_delay}s... (attempt {retry + 1}/{max_origin_retries})")
+                time.sleep(origin_retry_delay)
+                # Re-fetch status to check if originOnly changed
+                try:
+                    self.getStatus()
+                except Exception as e:
+                    self.logger.warning(f"Failed to re-fetch status: {e}")
+                    break
+            else:
+                self.logger.warning(f"Stream still origin-only after {max_origin_retries} attempts - skipping for now")
+                return []
+
+        # Build playlist URL - try multiple CDN hosts
+        cdn_hosts = ['doppiocdn.org', 'doppiocdn.com', 'doppiocdn.net', 'doppiocdn.live']
+        random.shuffle(cdn_hosts)
+
+        vr_suffix = '_vr' if self.vr else ''
+        auto_suffix = '_auto' if not self.vr else ''
+
+        result = None
+        playlist_url = None
+
+        for host in cdn_hosts:
+            playlist_url = f"https://edge-hls.{host}/hls/{stream_name}{vr_suffix}/master/{stream_name}{vr_suffix}{auto_suffix}.m3u8"
+            self.debug(f"Fetching playlist from: {playlist_url}")
+
+            try:
+                result = s.get(playlist_url, headers=self.headers, cookies=self.cookies, timeout=10)
+                self.debug(f"Playlist response from {host}: {result.status_code}")
+
+                if result.status_code == 200:
+                    break
+                elif result.status_code == 404:
+                    self.logger.warning(f"Playlist not found on {host}, trying next CDN...")
+                    result = None
+                else:
+                    self.logger.warning(f"Unexpected status {result.status_code} from {host}")
+                    result = None
+            except Exception as e:
+                self.logger.warning(f"Failed to fetch from {host}: {e}")
+                result = None
+
+        if not result or result.status_code != 200:
+            self.logger.error(f"Failed to fetch playlist from any CDN host")
             return []
 
-        m3u8_doc = result.content.decode("utf-8")
+        m3u8_doc = result.text
         self.debug(f"M3U8 content (first 300 chars): {m3u8_doc[:300]}")
 
         psch, pkey, pdkey = StripChat._getMouflonFromM3U(m3u8_doc)
@@ -647,12 +848,40 @@ class StripChat(Bot):
             self.logger.error("No variants found in playlist")
             return []
 
-        return [
-            variant
-            | {
-                "url": f"{variant['url']}{'&' if '?' in variant['url'] else '?'}psch={psch}&pkey={pkey}"
-            }
-            for variant in variants
-        ]
+        # Add authentication keys to variant URLs and rewrite to use direct CDN
+        # The master playlist returns media-hls.doppiocdn.X/b-hls-XX/... which is blocked (403)
+        # We need to rewrite to b-hls-XX.doppiocdn.live/hls/... which works
+        result = []
+        for variant in variants:
+            url = variant['url']
+
+            # Rewrite media-hls URLs to direct b-hls CDN
+            # From: https://media-hls.doppiocdn.com/b-hls-25/189420462/189420462.m3u8
+            # To:   https://b-hls-25.doppiocdn.live/hls/189420462/189420462.m3u8
+            import re
+            match = re.match(r'https://media-hls\.doppiocdn\.\w+/(b-hls-\d+)/(\d+)/(.+)', url)
+            if match:
+                b_hls_server = match.group(1)  # e.g., b-hls-25
+                stream_id = match.group(2)      # e.g., 189420462
+                filename = match.group(3)       # e.g., 189420462.m3u8?...
+
+                # Strip any existing query params from filename for reconstruction
+                if '?' in filename:
+                    filename_base = filename.split('?')[0]
+                else:
+                    filename_base = filename
+
+                # Construct the direct CDN URL with all keys
+                url = f"https://{b_hls_server}.doppiocdn.live/hls/{stream_id}/{filename_base}?psch={psch}&pkey={pkey}&pdkey={pdkey}"
+                self.debug(f"Rewrote variant URL to: {url[:60]}...")
+            else:
+                # URL doesn't match expected pattern - just add keys if missing
+                if 'pkey=' not in url or 'pdkey=' not in url:
+                    sep = '&' if '?' in url else '?'
+                    url = f"{url}{sep}psch={psch}&pkey={pkey}&pdkey={pdkey}"
+
+            result.append(variant | {"url": url})
+
+        return result
 
 Bot.loaded_sites.add(StripChat)

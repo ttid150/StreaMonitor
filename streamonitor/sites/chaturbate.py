@@ -14,6 +14,7 @@ class Chaturbate(Bot):
         self.vr = False  # Chaturbate doesn't have VR
         self.sleep_on_offline = 30
         self.sleep_on_error = 60
+        self._max_consecutive_errors = 50  # Chaturbate can be flaky, allow more retries
         self.url = self.getWebsiteURL()
     
     def get_site_color(self):
@@ -26,8 +27,16 @@ class Chaturbate(Bot):
     
     def getVideoUrl(self) -> Optional[str]:
         """Get the video stream URL."""
+        # If lastInfo is missing or stale, try to refresh it
         if not self.lastInfo or 'url' not in self.lastInfo:
-            return None
+            self.logger.debug("lastInfo missing URL, refreshing status...")
+            status = self.getStatus()
+            if status != Status.PUBLIC:
+                self.logger.warning(f"Cannot get video URL - status is {status}")
+                return None
+            if not self.lastInfo or 'url' not in self.lastInfo:
+                self.logger.error("Still no URL after refresh")
+                return None
             
         url = self.lastInfo['url']
         
@@ -60,6 +69,11 @@ class Chaturbate(Bot):
             
             if response.status_code != 200:
                 self.logger.warning(f"HTTP {response.status_code} for user {self.username}")
+                # Treat server errors as temporary (ratelimit) not permanent errors
+                if response.status_code >= 500 or response.status_code == 429:
+                    return Status.RATELIMIT
+                elif response.status_code == 404:
+                    return Status.NOTEXIST
                 return Status.ERROR
                 
             self.lastInfo = response.json()
