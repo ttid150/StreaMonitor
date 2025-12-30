@@ -488,10 +488,21 @@ class StripChat(Bot):
 
     @classmethod
     def m3u_decoder(cls, content):
+        """
+        Decode mouflon-protected m3u8 playlist.
+        
+        Handles two formats:
+        1. Old format (FILE): #EXT-X-MOUFLON:FILE:<base64_encrypted> - needs decryption
+        2. New format (URI): #EXT-X-MOUFLON:URI:<actual_url> - URL is already in plaintext
+        
+        Both formats use 'media.mp4' as a placeholder that gets replaced.
+        """
         _mouflon_file_attr = "#EXT-X-MOUFLON:FILE:"
+        _mouflon_uri_attr = "#EXT-X-MOUFLON:URI:"
         _mouflon_filename = 'media.mp4'
 
         def _decode(encrypted_b64: str, key: str) -> str:
+            """Decode base64+XOR encrypted string (old format)."""
             if cls._cached_keys is None:
                 cls._cached_keys = {}
             hash_bytes = cls._cached_keys[key] if key in cls._cached_keys \
@@ -504,14 +515,25 @@ class StripChat(Bot):
         decoded = ''
         lines = content.splitlines()
         last_decoded_file = None
+        
         for line in lines:
-            if line.startswith(_mouflon_file_attr):
-                last_decoded_file = _decode(line[len(_mouflon_file_attr):], pdkey)
+            # New format: URI is already plaintext, just extract it
+            if line.startswith(_mouflon_uri_attr):
+                last_decoded_file = line[len(_mouflon_uri_attr):].strip()
+            # Old format: needs base64+XOR decryption
+            elif line.startswith(_mouflon_file_attr):
+                try:
+                    last_decoded_file = _decode(line[len(_mouflon_file_attr):], pdkey)
+                except Exception as e:
+                    # Decryption failed - might be wrong key or format changed
+                    last_decoded_file = None
+            # Replace media.mp4 placeholder with actual URL
             elif line.endswith(_mouflon_filename) and last_decoded_file:
-                decoded += (line.replace(_mouflon_filename, last_decoded_file)) + '\n'
+                decoded += last_decoded_file + '\n'
                 last_decoded_file = None
             else:
                 decoded += line + '\n'
+        
         return decoded
 
     @classmethod
@@ -551,10 +573,21 @@ class StripChat(Bot):
         """
         Extract psch, pkey, pdkey from m3u8 MOUFLON tags.
         Uses cached class variables for pkey/pdkey.
+        The psch version is extracted from the m3u8 MOUFLON:PSCH tag.
         """
+        import re
+        
+        # Extract psch version from the m3u8 content
+        # Format: #EXT-X-MOUFLON:PSCH:v2:Zeechoej4aleeshi
+        psch = 'v2'  # Default to v2 as that's what current streams use
+        if m3u8_doc:
+            psch_match = re.search(r'#EXT-X-MOUFLON:PSCH:(v\d+):', m3u8_doc)
+            if psch_match:
+                psch = psch_match.group(1)
+        
         # Return cached keys directly - they were extracted once at startup
         if cls._mouflon_pkey and cls._mouflon_pdkey:
-            return 'v1', cls._mouflon_pkey, cls._mouflon_pdkey
+            return psch, cls._mouflon_pkey, cls._mouflon_pdkey
         
         # Keys missing - try to re-extract
         if cls._doppio_js_data:
@@ -564,14 +597,14 @@ class StripChat(Bot):
                 cls._mouflon_pkey = next(iter(cls._mouflon_keys.keys()))
                 cls._mouflon_pdkey = cls._mouflon_keys[cls._mouflon_pkey]
                 print(f"[StripChat] Re-extracted: pkey={cls._mouflon_pkey}, pdkey={cls._mouflon_pdkey}")
-                return 'v1', cls._mouflon_pkey, cls._mouflon_pdkey
+                return psch, cls._mouflon_pkey, cls._mouflon_pdkey
         
         # Fallback to hardcoded keys if all else fails
         print("[StripChat] Using hardcoded fallback keys in _getMouflonFromM3U")
         cls._mouflon_pkey = cls._FALLBACK_PKEY
         cls._mouflon_pdkey = cls._FALLBACK_PDKEY
         cls._mouflon_keys = {cls._FALLBACK_PKEY: cls._FALLBACK_PDKEY}
-        return 'v1', cls._mouflon_pkey, cls._mouflon_pdkey
+        return psch, cls._mouflon_pkey, cls._mouflon_pdkey
 
     @staticmethod
     def uniq():
