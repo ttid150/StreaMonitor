@@ -1,15 +1,12 @@
-import re
-import time
-import requests
 import base64
 import hashlib
-import random
 import itertools
-import json
 import os
-from functools import lru_cache
-from typing import Optional, Tuple, List, Dict
+import random
+import re
+import time
 
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -681,7 +678,45 @@ class StripChat(Bot):
     def getWebsiteURL(self):
         return "https://stripchat.com/" + self.username
 
+
+    def _getStatusData(self, username):
+        r = self.session.get(
+            f'https://stripchat.com/api/front/v2/models/username/{username}/cam?uniq={StripChat.uniq()}',
+            headers=self.headers
+        )
+
+        try:
+            data = r.json()
+        except requests.exceptions.JSONDecodeError:
+            self.log('Failed to parse JSON response')
+            return None
+        return data
+
+    def _update_lastInfo(self, data):
+        if data is None:
+            return None
+        if 'cam' not in data:
+            if 'error' in data:
+                error = data['error']
+                if error == 'Not Found':
+                    return Status.NOTEXIST
+                self.logger.warn(f'Status returned error: {error}')
+            return Status.UNKNOWN
+
+        self.lastInfo = {'model': data['user']['user']}
+        if isinstance(data['cam'], dict):
+            self.lastInfo |= data['cam']
+        return None
+
+    def _refresh_lastinfo_safe(self):
+        try:
+            data = self._getStatusData(self.username)
+            self._update_lastInfo(data)
+        except Exception as e:
+            self.logger.warning(f"Failed to refresh lastInfo: {e}")
+
     def getVideoUrl(self):
+        self._refresh_lastinfo_safe()
         return self.getWantedResolutionPlaylist(None)
 
     def getStreamName(self) -> str:
