@@ -1,12 +1,15 @@
-import base64
-import hashlib
-import itertools
-import os
-import random
 import re
 import time
-
 import requests
+import base64
+import hashlib
+import random
+import itertools
+import json
+import os
+from functools import lru_cache
+from typing import Optional, Tuple, List, Dict
+
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -141,7 +144,7 @@ class StripChat(Bot):
 
         # Find Doppio JS file
         doppio_js_name = None
-        
+
         # Try direct require pattern first (legacy)
         if match := cls._DOPPIO_REQUIRE_PATTERN.search(StripChat._main_js_data):
             doppio_js_name = match[1]
@@ -237,7 +240,7 @@ class StripChat(Bot):
         v2.1.3 key construction (const Jn=):
         - pkey: IIFE(45,196,195,...) + 36918.toString(36) = "Zeechoej4aleeshi"
         - pdkey: 0xaf004b1e62348.toString(36) + shifted(32) + 24.toString(36) + IIFE_first4 = "ubahjae7goPoodi6"
-        
+
         The keys are built from:
         1. Fixed numbers converted to base36
         2. Character shifts (-39)
@@ -274,7 +277,7 @@ class StripChat(Bot):
             try:
                 start = js_data.find('const Jn=')
                 if start != -1:
-                    chunk = js_data[start:start+3000]
+                    chunk = js_data[start:start + 3000]
 
                     # Find all IIFEs in the chunk - they appear as }(num,num,num,...)
                     all_iifes = re.findall(r'\}\((\d+(?:,\d+)+)\)', chunk)
@@ -331,7 +334,8 @@ class StripChat(Bot):
                         print(f"[StripChat] Extracted v2.1.3 keys: pkey={pkey}, pdkey={pdkey}")
                         return (pkey, pdkey)
                     elif len(pkey) >= 12 and len(pdkey) >= 12:
-                        print(f"[StripChat] Partially extracted keys: pkey={pkey}({len(pkey)}), pdkey={pdkey}({len(pdkey)})")
+                        print(
+                            f"[StripChat] Partially extracted keys: pkey={pkey}({len(pkey)}), pdkey={pdkey}({len(pdkey)})")
                         return (pkey, pdkey)
 
             except Exception as e:
@@ -353,7 +357,7 @@ class StripChat(Bot):
                     start = js_data.find('const ss=')
 
                 if start != -1:
-                    chunk = js_data[start:start+10000]
+                    chunk = js_data[start:start + 10000]
 
                     # Extract all numbers in toString(36) calls
                     # Format 1: 16..toString(36)
@@ -381,7 +385,7 @@ class StripChat(Bot):
                         if n > 1000000000000:  # Large number
                             p2 = numbers[n]
                             break
-                    
+
                     # IIFE for 'ale' (offset 11, 3-4 args)
                     p3 = ''
                     for args in iifes:
@@ -390,14 +394,14 @@ class StripChat(Bot):
                             if decoded.isalpha() and decoded.islower():
                                 p3 = decoded
                                 break
-                    
+
                     # 690102 = 'eshi'
                     p4 = numbers.get(690102, '')
-                    
+
                     # Build pdkey
                     # 39286 = 'uba'
                     p5 = numbers.get(39286, '')
-                    
+
                     # IIFE for 'hjae' (offset 10, 5 args)
                     p6 = ''
                     for args in iifes:
@@ -406,16 +410,16 @@ class StripChat(Bot):
                             if decoded.isalpha() and decoded.islower():
                                 p6 = decoded
                                 break
-                    
+
                     # 9672 = '7go'
                     p7 = numbers.get(9672, '')
-                    
+
                     # 32 >> -39 = 'P'
                     p8 = shift_chars(to_base36(32), -39) if 32 in numbers else ''
-                    
+
                     # 888 = 'oo'
                     p9 = numbers.get(888, '')
-                    
+
                     # IIFE for 'di' (offset 39, 3 args)
                     p10 = ''
                     for args in iifes:
@@ -424,54 +428,54 @@ class StripChat(Bot):
                             if decoded.isalpha() and decoded.islower():
                                 p10 = decoded
                                 break
-                    
+
                     # 6 = '6'
                     p11 = numbers.get(6, '')
-                    
+
                     pkey = p1 + p2 + p3 + p4
                     pdkey = p5 + p6 + p7 + p8 + p9 + p10 + p11
-                    
+
                     if len(pkey) >= 12 and len(pdkey) >= 12:
                         print(f"[StripChat] Extracted keys: pkey={pkey}, pdkey={pdkey}")
                         return (pkey, pdkey)
-                    
+
             except Exception as e:
                 print(f"[StripChat] v2.1.1 key extraction failed: {e}")
-        
+
         # Try legacy 'const ns=' pattern
         if 'const ns=' in js_data:
             try:
                 # Find the two IIFEs with their arguments
                 iife1_match = re.search(r'\}\((\d+(?:,\d+){8,12})\)', js_data)
                 iife2_match = re.search(r'\}\((\d{2},\d{3},\d{3})\)', js_data)
-                
+
                 if iife1_match and iife2_match:
                     args1 = [int(x) for x in iife1_match.group(1).split(',')]
                     n1 = args1[0]
                     remaining1 = args1[1:][::-1]
                     p4 = ''.join(chr((a - n1 - 26) - i) for i, a in enumerate(remaining1))
-                    
+
                     args2 = [int(x) for x in iife2_match.group(1).split(',')]
                     o2 = args2[0]
                     remaining2 = args2[1:][::-1]
                     p8 = ''.join(chr(((a - o2) - 56) - i) for i, a in enumerate(remaining2))
-                    
+
                     p1 = ''.join(chr(ord(c) - 13) for c in to_base36(16))
                     p2 = to_base36(0x531f77594da7d).lower()
                     p3 = to_base36(18676).lower()
                     p5 = to_base36(662856).lower()
                     p6 = ''.join(chr(ord(c) - 39) for c in to_base36(32).lower())
                     p7 = to_base36(31981).lower()
-                    
+
                     key_string = p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8
-                    
+
                     if ':' in key_string:
                         pkey, pdkey = key_string.split(':', 1)
                         if len(pkey) >= 8 and len(pdkey) >= 8:
                             return (pkey, pdkey)
             except Exception as e:
                 print(f"[StripChat] Legacy key extraction failed: {e}")
-        
+
         return None
 
     @classmethod
@@ -487,67 +491,90 @@ class StripChat(Bot):
     def m3u_decoder(cls, content):
         """
         Decode mouflon-protected m3u8 playlist.
-        
-        Handles two formats:
-        1. Old format (FILE): #EXT-X-MOUFLON:FILE:<base64_encrypted> - needs decryption
-        2. New format (URI): #EXT-X-MOUFLON:URI:<actual_url> - URL is already in plaintext
-        
-        Both formats use 'media.mp4' as a placeholder that gets replaced.
+
+        The mouflon protection works by:
+        1. Adding #EXT-X-MOUFLON:URI:<url> lines with encoded segment paths
+        2. Using 'media.mp4' as a placeholder in the actual playlist
+
+        The URL contains an encoded part (second-to-last underscore-separated segment)
+        that needs to be decoded using XOR with SHA256 hash of pdkey.
+
+        Example:
+        - Original: https://.../<timestamp>_<encoded>_media.mp4
+        - Decoded:  https://.../<timestamp>_<decoded>_media.mp4
         """
-        _mouflon_file_attr = "#EXT-X-MOUFLON:FILE:"
         _mouflon_uri_attr = "#EXT-X-MOUFLON:URI:"
         _mouflon_filename = 'media.mp4'
 
         def _decode(encrypted_b64: str, key: str) -> str:
-            """Decode base64+XOR encrypted string (old format)."""
+            """
+            Decode the encrypted URL part using reversed base64 + XOR.
+
+            The encryption is:
+            1. Original string -> base64 encode
+            2. Reverse the base64 string
+            3. XOR with SHA256 hash of the key (cycling)
+
+            So decryption is:
+            1. XOR with SHA256 hash of the key
+            2. Decode as base64 (after reversing back)
+            """
             if cls._cached_keys is None:
                 cls._cached_keys = {}
-            hash_bytes = cls._cached_keys[key] if key in cls._cached_keys \
-                else cls._cached_keys.setdefault(key, hashlib.sha256(key.encode("utf-8")).digest())
-            encrypted_data = base64.b64decode(encrypted_b64 + "==")
-            return bytes(a ^ b for (a, b) in zip(encrypted_data, itertools.cycle(hash_bytes))).decode("utf-8")
+            hash_bytes = cls._cached_keys.get(key)
+            if hash_bytes is None:
+                hash_bytes = hashlib.sha256(key.encode("utf-8")).digest()
+                cls._cached_keys[key] = hash_bytes
+
+            # The base64 is reversed, so reverse it back and add padding
+            encrypted_data = base64.b64decode(encrypted_b64[::-1] + '==')
+            # XOR decrypt
+            decoded_b64 = bytes(a ^ b for (a, b) in zip(encrypted_data, itertools.cycle(hash_bytes))).decode("utf-8")
+            return decoded_b64
 
         psch, pkey, pdkey = StripChat._getMouflonFromM3U(content)
 
         decoded = ''
         lines = content.splitlines()
-        last_decoded_file = None
-        
+        last_decoded_uri = None
+
         for line in lines:
-            # New format: URI is already plaintext, just extract it
             if line.startswith(_mouflon_uri_attr):
-                last_decoded_file = line[len(_mouflon_uri_attr):].strip()
-            # Old format: needs base64+XOR decryption
-            elif line.startswith(_mouflon_file_attr):
-                try:
-                    last_decoded_file = _decode(line[len(_mouflon_file_attr):], pdkey)
-                except Exception as e:
-                    # Decryption failed - might be wrong key or format changed
-                    last_decoded_file = None
-            # Replace media.mp4 placeholder with actual URL
-            elif line.endswith(_mouflon_filename) and last_decoded_file:
-                decoded += last_decoded_file + '\n'
-                last_decoded_file = None
+                # Extract the URI and decode the encoded part
+                uri = line[len(_mouflon_uri_attr):]
+                # The encoded part is the second-to-last underscore-separated segment
+                # Format: https://.../<timestamp>_<encoded>_media.mp4
+                parts = uri.split('_')
+                if len(parts) >= 2:
+                    encoded_part = parts[-2]
+                    decoded_part = _decode(encoded_part, pdkey)
+                    last_decoded_uri = uri.replace(encoded_part, decoded_part)
+                else:
+                    last_decoded_uri = uri
+            elif line.endswith(_mouflon_filename) and last_decoded_uri:
+                # Replace the media.mp4 placeholder with the decoded URI
+                decoded += last_decoded_uri + '\n'
+                last_decoded_uri = None
             else:
                 decoded += line + '\n'
-        
+
         return decoded
 
     @classmethod
     def getMouflonDecKey(cls, pkey):
         if cls._mouflon_keys is None:
             cls._mouflon_keys = {}
-        
+
         # Check if we already have the key cached
         if pkey in cls._mouflon_keys:
             return cls._mouflon_keys[pkey]
-        
+
         # Try legacy format: "pkey:pdkey"
         if cls._doppio_js_data:
             _pdks = re.findall(f'"{pkey}:(.*?)"', cls._doppio_js_data)
             if len(_pdks) > 0:
                 return cls._mouflon_keys.setdefault(pkey, _pdks[0])
-        
+
         # If not found, try to re-parse the keys with the specific pkey
         # This handles cases where the pkey wasn't in the initial parse
         if cls._doppio_js_data and cls._ln_array:
@@ -562,7 +589,7 @@ class StripChat(Bot):
                         pdkey = cls._ln_array[pdkey_idx]
                         if pdkey and pdkey.isalnum() and len(pdkey) >= 8:
                             return cls._mouflon_keys.setdefault(pkey, pdkey)
-        
+
         return None
 
     @classmethod
@@ -573,7 +600,7 @@ class StripChat(Bot):
         The psch version is extracted from the m3u8 MOUFLON:PSCH tag.
         """
         import re
-        
+
         # Extract psch version from the m3u8 content
         # Format: #EXT-X-MOUFLON:PSCH:v2:Zeechoej4aleeshi
         psch = 'v2'  # Default to v2 as that's what current streams use
@@ -581,11 +608,11 @@ class StripChat(Bot):
             psch_match = re.search(r'#EXT-X-MOUFLON:PSCH:(v\d+):', m3u8_doc)
             if psch_match:
                 psch = psch_match.group(1)
-        
+
         # Return cached keys directly - they were extracted once at startup
         if cls._mouflon_pkey and cls._mouflon_pdkey:
             return psch, cls._mouflon_pkey, cls._mouflon_pdkey
-        
+
         # Keys missing - try to re-extract
         if cls._doppio_js_data:
             print("[StripChat] Keys missing in _getMouflonFromM3U, attempting re-extraction...")
@@ -595,7 +622,7 @@ class StripChat(Bot):
                 cls._mouflon_pdkey = cls._mouflon_keys[cls._mouflon_pkey]
                 print(f"[StripChat] Re-extracted: pkey={cls._mouflon_pkey}, pdkey={cls._mouflon_pdkey}")
                 return psch, cls._mouflon_pkey, cls._mouflon_pdkey
-        
+
         # Fallback to hardcoded keys if all else fails
         print("[StripChat] Using hardcoded fallback keys in _getMouflonFromM3U")
         cls._mouflon_pkey = cls._FALLBACK_PKEY
@@ -673,50 +700,11 @@ class StripChat(Bot):
             if val is not None:
                 return val
         return None
-    
 
     def getWebsiteURL(self):
         return "https://stripchat.com/" + self.username
 
-
-    def _getStatusData(self, username):
-        r = self.session.get(
-            f'https://stripchat.com/api/front/v2/models/username/{username}/cam?uniq={StripChat.uniq()}',
-            headers=self.headers
-        )
-
-        try:
-            data = r.json()
-        except requests.exceptions.JSONDecodeError:
-            self.log('Failed to parse JSON response')
-            return None
-        return data
-
-    def _update_lastInfo(self, data):
-        if data is None:
-            return None
-        if 'cam' not in data:
-            if 'error' in data:
-                error = data['error']
-                if error == 'Not Found':
-                    return Status.NOTEXIST
-                self.logger.warn(f'Status returned error: {error}')
-            return Status.UNKNOWN
-
-        self.lastInfo = {'model': data['user']['user']}
-        if isinstance(data['cam'], dict):
-            self.lastInfo |= data['cam']
-        return None
-
-    def _refresh_lastinfo_safe(self):
-        try:
-            data = self._getStatusData(self.username)
-            self._update_lastInfo(data)
-        except Exception as e:
-            self.logger.warning(f"Failed to refresh lastInfo: {e}")
-
     def getVideoUrl(self):
-        self._refresh_lastinfo_safe()
         return self.getWantedResolutionPlaylist(None)
 
     def getStreamName(self) -> str:
@@ -898,14 +886,15 @@ class StripChat(Bot):
 
         # Check if model account has been deleted
         if self.getIsDeleted():
-            self.logger.warning(f'⚠️ Model account {self.username} has been deleted - this model will be auto-deregistered')
+            self.logger.warning(
+                f'⚠️ Model account {self.username} has been deleted - this model will be auto-deregistered')
             return Status.DELETED
 
         # Determine status - check isLive first as it's more reliable
         is_live = self.getIsLive()
         is_cam_available = self._get_by_path(self.lastInfo, ["isCamAvailable"]) or \
-                          self._get_by_path(self.lastInfo, ["cam", "isCamAvailable"]) or False
-        
+                           self._get_by_path(self.lastInfo, ["cam", "isCamAvailable"]) or False
+
         # If not live, check if camera is available (model is online but no stream yet)
         if not is_live:
             if is_cam_available:
@@ -913,7 +902,7 @@ class StripChat(Bot):
                 return Status.ONLINE
             # Not live and no camera available = offline
             return Status.OFFLINE
-        
+
         # If live, check the status field
         status = self.getStatusField()
         if status == "public":
@@ -924,17 +913,18 @@ class StripChat(Bot):
             return Status.PUBLIC
         if status in self._PRIVATE_STATUSES:
             return Status.PRIVATE
-        
+
         # Edge case: is_live=true but status is unclear - default to private to be safe
         if is_live and status is None:
             return Status.PRIVATE
-        
+
         # Status is set to something unexpected
         if status in ["off", "idle"]:
             return Status.OFFLINE
-        
+
         # Unknown status - log the actual data for debugging
-        self.logger.warning(f"Unknown status '{status}' for {self.username} - lastInfo keys: {list(self.lastInfo.keys())}")
+        self.logger.warning(
+            f"Unknown status '{status}' for {self.username} - lastInfo keys: {list(self.lastInfo.keys())}")
         self.logger.debug(f"Full response for {self.username}: {str(self.lastInfo)[:500]}")
         return Status.UNKNOWN
 
@@ -942,19 +932,20 @@ class StripChat(Bot):
         """Fetch HLS playlist variants with mouflon encryption keys."""
         s = self._get_session()
         stream_name = self.getStreamName()
-        
+
         # Check if stream is origin-only (not yet replicated to edge CDN)
         # This is a temporary state - retry a few times with delay
         max_origin_retries = 5
         origin_retry_delay = 3  # seconds
-        
+
         for retry in range(max_origin_retries):
             origin_only = self._get_by_path(self.lastInfo, ["cam", "broadcastSettings", "originOnly"])
             if not origin_only:
                 break
-            
+
             if retry < max_origin_retries - 1:
-                self.logger.info(f"Stream is origin-only (not on edge CDN yet), waiting {origin_retry_delay}s... (attempt {retry + 1}/{max_origin_retries})")
+                self.logger.info(
+                    f"Stream is origin-only (not on edge CDN yet), waiting {origin_retry_delay}s... (attempt {retry + 1}/{max_origin_retries})")
                 time.sleep(origin_retry_delay)
                 # Re-fetch status to check if originOnly changed
                 try:
@@ -965,25 +956,25 @@ class StripChat(Bot):
             else:
                 self.logger.warning(f"Stream still origin-only after {max_origin_retries} attempts - skipping for now")
                 return []
-        
+
         # Build playlist URL - try multiple CDN hosts
         cdn_hosts = ['doppiocdn.org', 'doppiocdn.com', 'doppiocdn.net', 'doppiocdn.live']
         random.shuffle(cdn_hosts)
-        
+
         vr_suffix = '_vr' if self.vr else ''
         auto_suffix = '_auto' if not self.vr else ''
-        
+
         result = None
         playlist_url = None
-        
+
         for host in cdn_hosts:
             playlist_url = f"https://edge-hls.{host}/hls/{stream_name}{vr_suffix}/master/{stream_name}{vr_suffix}{auto_suffix}.m3u8"
             self.debug(f"Fetching playlist from: {playlist_url}")
-            
+
             try:
                 result = s.get(playlist_url, headers=self.headers, cookies=self.cookies, timeout=10)
                 self.debug(f"Playlist response from {host}: {result.status_code}")
-                
+
                 if result.status_code == 200:
                     break
                 elif result.status_code == 404:
@@ -995,36 +986,37 @@ class StripChat(Bot):
             except Exception as e:
                 self.logger.warning(f"Failed to fetch from {host}: {e}")
                 result = None
-        
+
         if not result or result.status_code != 200:
             self.logger.error(f"Failed to fetch playlist from any CDN host")
             return []
-            
+
         m3u8_doc = result.text
         self.debug(f"M3U8 content (first 300 chars): {m3u8_doc[:300]}")
-        
+
         psch, pkey, pdkey = StripChat._getMouflonFromM3U(m3u8_doc)
         self.debug(f"Extracted key psch={psch}, pkey={pkey}, pdkey={pdkey}")
-        
+
         if not pkey:
             self.logger.error("No mouflon pkey available - keys not extracted at startup?")
-            self.debug(f"Class state: _mouflon_pkey={StripChat._mouflon_pkey}, _mouflon_pdkey={StripChat._mouflon_pdkey}")
+            self.debug(
+                f"Class state: _mouflon_pkey={StripChat._mouflon_pkey}, _mouflon_pdkey={StripChat._mouflon_pdkey}")
             return []
-        
+
         variants = super().getPlaylistVariants(m3u_data=m3u8_doc)
         self.debug(f"Parsed {len(variants) if variants else 0} variants from playlist")
-        
+
         if not variants:
             self.logger.error("No variants found in playlist")
             return []
-        
+
         # Add authentication keys to variant URLs and rewrite to use direct CDN
         # The master playlist returns media-hls.doppiocdn.X/b-hls-XX/... which is blocked (403)
         # We need to rewrite to b-hls-XX.doppiocdn.live/hls/... which works
         result = []
         for variant in variants:
             url = variant['url']
-            
+
             # Rewrite media-hls URLs to direct b-hls CDN
             # From: https://media-hls.doppiocdn.com/b-hls-25/189420462/189420462.m3u8
             # To:   https://b-hls-25.doppiocdn.live/hls/189420462/189420462.m3u8
@@ -1032,15 +1024,15 @@ class StripChat(Bot):
             match = re.match(r'https://media-hls\.doppiocdn\.\w+/(b-hls-\d+)/(\d+)/(.+)', url)
             if match:
                 b_hls_server = match.group(1)  # e.g., b-hls-25
-                stream_id = match.group(2)      # e.g., 189420462
-                filename = match.group(3)       # e.g., 189420462.m3u8?...
-                
+                stream_id = match.group(2)  # e.g., 189420462
+                filename = match.group(3)  # e.g., 189420462.m3u8?...
+
                 # Strip any existing query params from filename for reconstruction
                 if '?' in filename:
                     filename_base = filename.split('?')[0]
                 else:
                     filename_base = filename
-                
+
                 # Construct the direct CDN URL with all keys
                 url = f"https://{b_hls_server}.doppiocdn.live/hls/{stream_id}/{filename_base}?psch={psch}&pkey={pkey}&pdkey={pdkey}"
                 self.debug(f"Rewrote variant URL to: {url[:60]}...")
@@ -1049,9 +1041,10 @@ class StripChat(Bot):
                 if 'pkey=' not in url or 'pdkey=' not in url:
                     sep = '&' if '?' in url else '?'
                     url = f"{url}{sep}psch={psch}&pkey={pkey}&pdkey={pdkey}"
-            
+
             result.append(variant | {"url": url})
-        
+
         return result
+
 
 Bot.loaded_sites.add(StripChat)
